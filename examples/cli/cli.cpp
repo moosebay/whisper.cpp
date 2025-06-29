@@ -12,6 +12,9 @@
 #include <vector>
 #include <cstring>
 #include <cfloat>
+#include <unordered_map>
+#include <sstream>
+#include <algorithm>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -27,6 +30,49 @@ static void replace_all(std::string & s, const std::string & search, const std::
         if (pos == std::string::npos) break;
         s.erase(pos, search.length());
         s.insert(pos, replace);
+    }
+}
+
+// Logit bias data structure
+struct BiasData {
+    std::unordered_map<whisper_token, float> weight;
+};
+
+// Bias callback function
+void bias_callback(
+    struct whisper_context * /*ctx*/,
+    struct whisper_state * /*state*/,
+    const whisper_token_data * tokens,
+    int n_tokens,
+    float * logits,
+    void * user_data) {
+    
+    const auto &bias = *(BiasData*)user_data;
+    
+    // Apply multiplicative bias to logits
+    // The tokens array contains the top tokens sorted by probability
+    // We need to modify the logits array for all our biased tokens
+    for (const auto& pair : bias.weight) {
+        whisper_token token_id = pair.first;
+        float factor = pair.second;
+        // logits[token_id] += log(factor) to multiply probability by factor
+        logits[token_id] += std::log(factor);
+    }
+}
+
+// Add word bias helper
+void add_word_bias(whisper_context *ctx,
+                   const std::string &w,
+                   float factor,
+                   BiasData &bias) {
+    // First get the token count
+    int n_tokens = -whisper_tokenize(ctx, w.c_str(), nullptr, 0);
+    if (n_tokens > 0) {
+        std::vector<whisper_token> tokens(n_tokens);
+        whisper_tokenize(ctx, w.c_str(), tokens.data(), n_tokens);
+        for (auto t : tokens) {
+            bias.weight[t] = factor;
+        }
     }
 }
 
@@ -94,6 +140,7 @@ struct whisper_params {
     std::string openvino_encode_device = "CPU";
 
     std::string dtw = "";
+    std::string logit_bias = "";  // format: "word1:factor1,word2:factor2"
 
     std::vector<std::string> fname_inp = {};
     std::vector<std::string> fname_out = {};
@@ -195,6 +242,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (                  arg == "--suppress-regex")  { params.suppress_regex  = ARGV_NEXT; }
+        else if (                  arg == "--logit-bias")      { params.logit_bias      = ARGV_NEXT; }
         else if (                  arg == "--grammar")         { params.grammar         = ARGV_NEXT; }
         else if (                  arg == "--grammar-rule")    { params.grammar_rule    = ARGV_NEXT; }
         else if (                  arg == "--grammar-penalty") { params.grammar_penalty = std::stof(ARGV_NEXT); }
@@ -274,6 +322,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -fa,       --flash-attn        [%-7s] flash attention\n",                                params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n",                     params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  --suppress-regex REGEX         [%-7s] regular expression matching tokens to suppress\n", params.suppress_regex.c_str());
+    fprintf(stderr, "  --logit-bias WORD:FACTOR       [%-7s] word-specific bias (e.g. word1:2.5,word2:3.0)\n",   params.logit_bias.c_str());
     fprintf(stderr, "  --grammar GRAMMAR              [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
     fprintf(stderr, "  --grammar-rule RULE            [%-7s] top-level GBNF grammar rule name\n",               params.grammar_rule.c_str());
     fprintf(stderr, "  --grammar-penalty N            [%-7.1f] scales down logits of nongrammar tokens\n",      params.grammar_penalty);
@@ -1252,6 +1301,27 @@ int main(int argc, char ** argv) {
                     return is_aborted;
                 };
                 wparams.abort_callback_user_data = &is_aborted;
+            }
+
+            // Setup logit bias if provided
+            BiasData bias_data;
+            if (!params.logit_bias.empty()) {
+                // Parse logit bias string: "word1:factor1,word2:factor2"
+                std::stringstream ss(params.logit_bias);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    size_t colon_pos = item.find(':');
+                    if (colon_pos != std::string::npos) {
+                        std::string word = item.substr(0, colon_pos);
+                        float factor = std::stof(item.substr(colon_pos + 1));
+                        add_word_bias(ctx, word, factor, bias_data);
+                    }
+                }
+                
+                if (!bias_data.weight.empty()) {
+                    wparams.logits_filter_callback = bias_callback;
+                    wparams.logits_filter_callback_user_data = &bias_data;
+                }
             }
 
             if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
