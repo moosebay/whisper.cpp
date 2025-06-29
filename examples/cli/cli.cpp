@@ -12,6 +12,11 @@
 #include <vector>
 #include <cstring>
 #include <cfloat>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <regex>
+#include <unordered_map>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -28,6 +33,88 @@ static void replace_all(std::string & s, const std::string & search, const std::
         s.erase(pos, search.length());
         s.insert(pos, replace);
     }
+}
+
+// Escape any regex metacharacters in a term
+static std::string regex_escape(const std::string & s) {
+    static const std::regex metachars(R"([.^$|()\\+*\[\]{}?])");
+    return std::regex_replace(s, metachars, R"(\$&)");
+}
+
+static std::string to_lower(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        out.push_back(std::tolower(c));
+    }
+    return out;
+}
+
+// Function to apply bias terms to text - performs case-insensitive find and replace
+static std::string apply_bias_terms(const std::string & text, const std::string & bias_terms_str) {
+    if (bias_terms_str.empty()) {
+        return text;
+    }
+    
+    // Parse, trim, and dedupe terms
+    std::vector<std::string> terms;
+    {
+        std::stringstream ss(bias_terms_str);
+        std::string t;
+        while (std::getline(ss, t, ',')) {
+            // Trim both ends
+            auto a = t.find_first_not_of(" \t");
+            if (a == std::string::npos) continue;
+            auto b = t.find_last_not_of(" \t");
+            terms.push_back(t.substr(a, b - a + 1));
+        }
+        std::sort(terms.begin(), terms.end());
+        terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+        if (terms.empty()) return text;
+    }
+    
+    // Build alternation: \b(?:Term1|Term2|Term3)\b
+    std::string alt;
+    for (auto & t : terms) {
+        if (!alt.empty()) alt += "|";
+        alt += regex_escape(t);
+    }
+    std::regex re("\\b(?:" + alt + ")\\b", std::regex::icase);
+    
+    // Walk through matches and rebuild
+    std::string result;
+    std::string::const_iterator searchStart = text.cbegin();
+    std::smatch match;
+    
+    while (std::regex_search(searchStart, text.cend(), match, re)) {
+        // Append text before match
+        result.append(searchStart, match[0].first);
+        
+        // Figure out which term this was
+        std::string found = match.str(0);
+        std::string low = to_lower(found);
+        bool replaced = false;
+        
+        for (auto & canon : terms) {
+            if (to_lower(canon) == low) {
+                result += canon;    // Use the correct-capitalization version
+                replaced = true;
+                break;
+            }
+        }
+        
+        if (!replaced) {
+            // Fallback, should never really happen
+            result += found;
+        }
+        
+        // Advance past this match
+        searchStart = match[0].second;
+    }
+    
+    // Append the rest
+    result.append(searchStart, text.cend());
+    return result;
 }
 
 // command-line parameters
@@ -94,6 +181,8 @@ struct whisper_params {
     std::string openvino_encode_device = "CPU";
 
     std::string dtw = "";
+    std::string bias_terms = "";
+    std::string logit_bias = "";  // format: "word1:factor1,word2:factor2"
 
     std::vector<std::string> fname_inp = {};
     std::vector<std::string> fname_out = {};
@@ -195,6 +284,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (                  arg == "--suppress-regex")  { params.suppress_regex  = ARGV_NEXT; }
+        else if (                  arg == "--bias-terms")     { params.bias_terms      = ARGV_NEXT; }
         else if (                  arg == "--grammar")         { params.grammar         = ARGV_NEXT; }
         else if (                  arg == "--grammar-rule")    { params.grammar_rule    = ARGV_NEXT; }
         else if (                  arg == "--grammar-penalty") { params.grammar_penalty = std::stof(ARGV_NEXT); }
@@ -274,6 +364,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -fa,       --flash-attn        [%-7s] flash attention\n",                                params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n",                     params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  --suppress-regex REGEX         [%-7s] regular expression matching tokens to suppress\n", params.suppress_regex.c_str());
+    fprintf(stderr, "  --bias-terms TERMS             [%-7s] comma-separated terms to preserve capitalization\n", params.bias_terms.c_str());
     fprintf(stderr, "  --grammar GRAMMAR              [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
     fprintf(stderr, "  --grammar-rule RULE            [%-7s] top-level GBNF grammar rule name\n",               params.grammar_rule.c_str());
     fprintf(stderr, "  --grammar-penalty N            [%-7.1f] scales down logits of nongrammar tokens\n",      params.grammar_penalty);
@@ -411,8 +502,9 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
             }
         } else {
             const char * text = whisper_full_get_segment_text(ctx, i);
+            std::string processed_text = apply_bias_terms(text, params.bias_terms);
 
-            printf("%s%s", speaker.c_str(), text);
+            printf("%s%s", speaker.c_str(), processed_text.c_str());
         }
 
         if (params.tinydiarize) {
@@ -434,6 +526,7 @@ static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
         const char * text = whisper_full_get_segment_text(ctx, i);
+        std::string processed_text = apply_bias_terms(text, params.bias_terms);
         std::string speaker = "";
 
         if (params.diarize && pcmf32s.size() == 2)
@@ -443,7 +536,7 @@ static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const
             speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
         }
 
-        fout << speaker << text << "\n";
+        fout << speaker << processed_text << "\n";
     }
 }
 
