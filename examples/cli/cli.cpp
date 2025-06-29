@@ -12,6 +12,8 @@
 #include <vector>
 #include <cstring>
 #include <cfloat>
+#include <algorithm>
+#include <sstream>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -28,6 +30,136 @@ static void replace_all(std::string & s, const std::string & search, const std::
         s.erase(pos, search.length());
         s.insert(pos, replace);
     }
+}
+
+// Simple Levenshtein distance implementation
+static int levenshtein_distance(const std::string& s1, const std::string& s2) {
+    const size_t m = s1.size();
+    const size_t n = s2.size();
+    
+    if (m == 0) return n;
+    if (n == 0) return m;
+    
+    std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1));
+    
+    for (size_t i = 0; i <= m; i++) {
+        dp[i][0] = i;
+    }
+    for (size_t j = 0; j <= n; j++) {
+        dp[0][j] = j;
+    }
+    
+    for (size_t i = 1; i <= m; i++) {
+        for (size_t j = 1; j <= n; j++) {
+            int cost = (std::tolower(s1[i-1]) == std::tolower(s2[j-1])) ? 0 : 1;
+            dp[i][j] = std::min({dp[i-1][j] + 1,      // deletion
+                                 dp[i][j-1] + 1,      // insertion
+                                 dp[i-1][j-1] + cost}); // substitution
+        }
+    }
+    
+    return dp[m][n];
+}
+
+// Find best match from candidates based on minimum edit distance to keywords
+static std::string find_best_match(const std::vector<std::string>& candidates,
+                                   const std::vector<std::string>& keywords) {
+    if (candidates.empty()) return "";
+    if (keywords.empty()) return candidates[0];
+    
+    int best_idx = 0;
+    int best_distance = INT_MAX;
+    
+    for (size_t i = 0; i < candidates.size(); i++) {
+        int min_distance = INT_MAX;
+        
+        // Find minimum distance to any keyword
+        for (const auto& keyword : keywords) {
+            int dist = levenshtein_distance(candidates[i], keyword);
+            min_distance = std::min(min_distance, dist);
+        }
+        
+        if (min_distance < best_distance) {
+            best_distance = min_distance;
+            best_idx = i;
+        }
+    }
+    
+    return candidates[best_idx];
+}
+
+// Apply fuzzy matching to correct text based on keywords
+static std::string apply_fuzzy_correction(const std::string& text, const std::vector<std::string>& keywords, float base_threshold = 2.0f, float threshold_factor = 0.6f) {
+    if (keywords.empty() || text.empty()) {
+        return text;
+    }
+    
+    // Split text into words
+    std::vector<std::string> words;
+    std::string current_word;
+    for (char c : text) {
+        if (std::isspace(c)) {
+            if (!current_word.empty()) {
+                words.push_back(current_word);
+                current_word.clear();
+            }
+            words.push_back(std::string(1, c)); // preserve spaces
+        } else {
+            current_word += c;
+        }
+    }
+    if (!current_word.empty()) {
+        words.push_back(current_word);
+    }
+    
+    // For each word, check if it's close to any keyword
+    std::string result;
+    for (const auto& word : words) {
+        if (std::isspace(word[0])) {
+            result += word;
+            continue;
+        }
+        
+        // Find closest keyword
+        int min_distance = INT_MAX;
+        std::string best_keyword = word;
+        
+        for (const auto& keyword : keywords) {
+            int dist = levenshtein_distance(word, keyword);
+            // Only replace if very close and reasonable match
+            // Distance threshold based on word length
+            int threshold = std::max((int)base_threshold, (int)(keyword.length() * threshold_factor));
+            if (dist <= threshold && dist < min_distance) {
+                // Additional check: at least first letter should match (case-insensitive)
+                if (std::tolower(word[0]) == std::tolower(keyword[0])) {
+                    min_distance = dist;
+                    best_keyword = keyword;
+                }
+            }
+        }
+        
+        result += best_keyword;
+    }
+    
+    return result;
+}
+
+// Parse comma-separated keywords
+static std::vector<std::string> parse_keywords(const std::string& keywords_str) {
+    std::vector<std::string> keywords;
+    if (keywords_str.empty()) return keywords;
+    
+    std::stringstream ss(keywords_str);
+    std::string keyword;
+    while (std::getline(ss, keyword, ',')) {
+        // Trim whitespace
+        keyword.erase(0, keyword.find_first_not_of(" \t"));
+        keyword.erase(keyword.find_last_not_of(" \t") + 1);
+        if (!keyword.empty()) {
+            keywords.push_back(keyword);
+        }
+    }
+    return keywords;
 }
 
 // command-line parameters
@@ -94,6 +226,9 @@ struct whisper_params {
     std::string openvino_encode_device = "CPU";
 
     std::string dtw = "";
+    std::string bias_terms = "";  // comma-separated terms for fuzzy matching
+    float bias_distance_base = 2.0f;  // base distance threshold
+    float bias_distance_factor = 0.6f;  // multiplier for keyword length
 
     std::vector<std::string> fname_inp = {};
     std::vector<std::string> fname_out = {};
@@ -195,6 +330,9 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (                  arg == "--suppress-regex")  { params.suppress_regex  = ARGV_NEXT; }
+        else if (                  arg == "--bias-terms")      { params.bias_terms      = ARGV_NEXT; }
+        else if (                  arg == "--bias-distance-base") { params.bias_distance_base = std::stof(ARGV_NEXT); }
+        else if (                  arg == "--bias-distance-factor") { params.bias_distance_factor = std::stof(ARGV_NEXT); }
         else if (                  arg == "--grammar")         { params.grammar         = ARGV_NEXT; }
         else if (                  arg == "--grammar-rule")    { params.grammar_rule    = ARGV_NEXT; }
         else if (                  arg == "--grammar-penalty") { params.grammar_penalty = std::stof(ARGV_NEXT); }
@@ -274,6 +412,9 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -fa,       --flash-attn        [%-7s] flash attention\n",                                params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n",                     params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  --suppress-regex REGEX         [%-7s] regular expression matching tokens to suppress\n", params.suppress_regex.c_str());
+    fprintf(stderr, "  --bias-terms TERMS             [%-7s] comma-separated terms for fuzzy matching\n",         params.bias_terms.c_str());
+    fprintf(stderr, "  --bias-distance-base N         [%-7.1f] base edit distance threshold\n",                   params.bias_distance_base);
+    fprintf(stderr, "  --bias-distance-factor N       [%-7.1f] distance threshold factor (threshold = max(base, length*factor))\n", params.bias_distance_factor);
     fprintf(stderr, "  --grammar GRAMMAR              [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
     fprintf(stderr, "  --grammar-rule RULE            [%-7s] top-level GBNF grammar rule name\n",               params.grammar_rule.c_str());
     fprintf(stderr, "  --grammar-penalty N            [%-7.1f] scales down logits of nongrammar tokens\n",      params.grammar_penalty);
@@ -345,6 +486,14 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
     const auto & params  = *((whisper_print_user_data *) user_data)->params;
     const auto & pcmf32s = *((whisper_print_user_data *) user_data)->pcmf32s;
 
+    // Parse keywords once
+    static std::vector<std::string> keywords;
+    static bool keywords_parsed = false;
+    if (!keywords_parsed) {
+        keywords = parse_keywords(params.bias_terms);
+        keywords_parsed = true;
+    }
+
     const int n_segments = whisper_full_n_segments(ctx);
 
     std::string speaker = "";
@@ -411,8 +560,9 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
             }
         } else {
             const char * text = whisper_full_get_segment_text(ctx, i);
+            std::string corrected_text = apply_fuzzy_correction(text ? text : "", keywords, params.bias_distance_base, params.bias_distance_factor);
 
-            printf("%s%s", speaker.c_str(), text);
+            printf("%s%s", speaker.c_str(), corrected_text.c_str());
         }
 
         if (params.tinydiarize) {
@@ -431,9 +581,13 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
 }
 
 static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+    // Parse keywords
+    std::vector<std::string> keywords = parse_keywords(params.bias_terms);
+    
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
         const char * text = whisper_full_get_segment_text(ctx, i);
+        std::string corrected_text = apply_fuzzy_correction(text ? text : "", keywords);
         std::string speaker = "";
 
         if (params.diarize && pcmf32s.size() == 2)
@@ -443,7 +597,7 @@ static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const
             speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
         }
 
-        fout << speaker << text << "\n";
+        fout << speaker << corrected_text << "\n";
     }
 }
 
