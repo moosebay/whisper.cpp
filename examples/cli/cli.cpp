@@ -12,6 +12,10 @@
 #include <vector>
 #include <cstring>
 #include <cfloat>
+#include <map>
+#include <sstream>
+#include <algorithm>
+#include <set>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -27,6 +31,186 @@ static void replace_all(std::string & s, const std::string & search, const std::
         if (pos == std::string::npos) break;
         s.erase(pos, search.length());
         s.insert(pos, replace);
+    }
+}
+
+// Bias terms constraint structure
+struct bias_terms_constraint {
+    struct bias_term_info {
+        std::vector<whisper_token> token_ids;
+        std::string original_text;
+    };
+    
+    std::vector<bias_term_info> bias_terms;
+    std::vector<std::vector<whisper_token>> bias_token_sequences;
+    std::map<whisper_token, std::vector<int>> token_to_sequences; // token -> sequence indices
+    
+    // Check if tokens starting at position match any bias term
+    // Returns index of matching bias term or -1 if no match
+    int match_bias_term(const std::vector<whisper_token>& tokens, int start_pos) const {
+        for (size_t i = 0; i < bias_terms.size(); i++) {
+            const auto& term = bias_terms[i];
+            if (start_pos + term.token_ids.size() <= tokens.size()) {
+                bool match = true;
+                for (size_t j = 0; j < term.token_ids.size(); j++) {
+                    if (tokens[start_pos + j] != term.token_ids[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+    
+    void init(whisper_context * ctx, const std::string & bias_terms) {
+        if (bias_terms.empty()) return;
+        
+        // Parse comma-separated bias terms
+        std::stringstream ss(bias_terms);
+        std::string term;
+        std::vector<std::string> terms;
+        
+        while (std::getline(ss, term, ',')) {
+            // Trim whitespace
+            term.erase(0, term.find_first_not_of(" \t"));
+            term.erase(term.find_last_not_of(" \t") + 1);
+            if (!term.empty()) {
+                terms.push_back(term);
+            }
+        }
+        
+        // Convert terms to token sequences
+        for (const auto & bias_term : terms) {
+            // Add leading space for consistency with Whisper tokenization
+            std::string term_with_space = " " + bias_term;
+            
+            std::vector<whisper_token> tokens(whisper_n_text_ctx(ctx));
+            int n_tokens = whisper_tokenize(ctx, term_with_space.c_str(), tokens.data(), tokens.size());
+            if (n_tokens > 0) {
+                tokens.resize(n_tokens);
+                int seq_idx = bias_token_sequences.size();
+                bias_token_sequences.push_back(tokens);
+                
+                // Store both token sequence and original text with proper casing
+                bias_term_info info;
+                info.token_ids = tokens;
+                info.original_text = term_with_space;
+                this->bias_terms.push_back(info);
+                
+                // Map each token to the sequences it appears in
+                for (whisper_token token : tokens) {
+                    token_to_sequences[token].push_back(seq_idx);
+                }
+                
+                // printf("Bias term '%s' -> %d tokens\n", bias_term.c_str(), n_tokens);
+            }
+        }
+        
+        // printf("Initialized %zu bias term sequences\n", bias_token_sequences.size());
+    }
+};
+
+// Merge bias-term sub-tokens into their original_text for one-pass output
+static std::string rebuild_segment_text(
+    struct whisper_context * ctx,
+    int segment_idx,
+    const bias_terms_constraint * bias_constraint)
+{
+    const int n = whisper_full_n_tokens(ctx, segment_idx);
+    std::vector<whisper_token> toks(n);
+    for (int i = 0; i < n; ++i) {
+        toks[i] = whisper_full_get_token_id(ctx, segment_idx, i);
+    }
+    std::string out;
+    for (int i = 0; i < n; ++i) {
+        // Skip special tokens (EOT, etc.)
+        if (toks[i] >= whisper_token_eot(ctx)) {
+            continue;
+        }
+        
+        if (bias_constraint && !bias_constraint->bias_terms.empty()) {
+            int bi = bias_constraint->match_bias_term(toks, i);
+            if (bi >= 0) {
+                // emit the full, correctly-cased bias term and skip its tokens
+                out += bias_constraint->bias_terms[bi].original_text;
+                i += int(bias_constraint->bias_terms[bi].token_ids.size()) - 1;
+                continue;
+            }
+        }
+        // fallback: emit the raw token text
+        out += whisper_full_get_token_text(ctx, segment_idx, i);
+    }
+    return out;
+}
+
+// Bias terms logits filter callback
+static void bias_terms_logits_filter(
+    struct whisper_context * ctx,
+    struct whisper_state * /*state*/,
+    const whisper_token_data * tokens,
+    int n_tokens,
+    float * logits,
+    void * user_data) {
+    
+    auto * constraint = (bias_terms_constraint *) user_data;
+    if (!constraint || constraint->bias_token_sequences.empty()) {
+        return;
+    }
+    
+    // At the start of decoding, boost bias term first tokens
+    if (n_tokens <= 1) {
+        std::set<whisper_token> first_tokens;
+        for (const auto & seq : constraint->bias_token_sequences) {
+            if (!seq.empty()) {
+                first_tokens.insert(seq[0]);
+            }
+        }
+        
+        // Boost first tokens of bias terms
+        for (whisper_token token : first_tokens) {
+            logits[token] += 15.0f; // Boost by 15.0
+        }
+        return;
+    }
+    
+    // For subsequent tokens, check if we're continuing a bias term
+    if (n_tokens > 1) {
+        whisper_token last_token = tokens[n_tokens - 1].id;
+        
+        // Find sequences that could be continued
+        auto it = constraint->token_to_sequences.find(last_token);
+        if (it != constraint->token_to_sequences.end()) {
+            std::set<whisper_token> next_tokens;
+            
+            for (int seq_idx : it->second) {
+                const auto & seq = constraint->bias_token_sequences[seq_idx];
+                
+                // Check if current token sequence matches prefix of this bias sequence
+                bool matches = true;
+                int check_len = std::min(n_tokens, (int)seq.size());
+                int start_pos = std::max(0, n_tokens - check_len);
+                
+                for (int i = 0; i < check_len && matches; i++) {
+                    if (tokens[start_pos + i].id != seq[i]) {
+                        matches = false;
+                    }
+                }
+                
+                // If we match and there's a next token in the sequence, boost it
+                if (matches && n_tokens < (int)seq.size()) {
+                    next_tokens.insert(seq[n_tokens]);
+                }
+            }
+            
+            // Boost continuation tokens
+            for (whisper_token token : next_tokens) {
+                logits[token] += 12.0f; // Boost by 12.0
+            }
+        }
     }
 }
 
@@ -90,6 +274,9 @@ struct whisper_params {
 
     // A regular expression that matches tokens to suppress
     std::string suppress_regex;
+
+    // Bias terms for constrained generation
+    std::string bias_terms;
 
     std::string openvino_encode_device = "CPU";
 
@@ -195,6 +382,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (                  arg == "--suppress-regex")  { params.suppress_regex  = ARGV_NEXT; }
+        else if (                  arg == "--bias-terms")      { params.bias_terms      = ARGV_NEXT; }
         else if (                  arg == "--grammar")         { params.grammar         = ARGV_NEXT; }
         else if (                  arg == "--grammar-rule")    { params.grammar_rule    = ARGV_NEXT; }
         else if (                  arg == "--grammar-penalty") { params.grammar_penalty = std::stof(ARGV_NEXT); }
@@ -274,6 +462,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -fa,       --flash-attn        [%-7s] flash attention\n",                                params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n",                     params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  --suppress-regex REGEX         [%-7s] regular expression matching tokens to suppress\n", params.suppress_regex.c_str());
+    fprintf(stderr, "  --bias-terms TERMS             [%-7s] comma-separated bias terms for constrained generation\n", params.bias_terms.c_str());
     fprintf(stderr, "  --grammar GRAMMAR              [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
     fprintf(stderr, "  --grammar-rule RULE            [%-7s] top-level GBNF grammar rule name\n",               params.grammar_rule.c_str());
     fprintf(stderr, "  --grammar-penalty N            [%-7.1f] scales down logits of nongrammar tokens\n",      params.grammar_penalty);
@@ -297,6 +486,7 @@ struct whisper_print_user_data {
 
     const std::vector<std::vector<float>> * pcmf32s;
     int progress_prev;
+    const bias_terms_constraint * bias_constraint;
 };
 
 static std::string estimate_diarization_speaker(std::vector<std::vector<float>> pcmf32s, int64_t t0, int64_t t1, bool id_only = false) {
@@ -344,6 +534,7 @@ static void whisper_print_progress_callback(struct whisper_context * /*ctx*/, st
 static void whisper_print_segment_callback(struct whisper_context * ctx, struct whisper_state * /*state*/, int n_new, void * user_data) {
     const auto & params  = *((whisper_print_user_data *) user_data)->params;
     const auto & pcmf32s = *((whisper_print_user_data *) user_data)->pcmf32s;
+    const auto * bias_constraint = ((whisper_print_user_data *) user_data)->bias_constraint;
 
     const int n_segments = whisper_full_n_segments(ctx);
 
@@ -374,10 +565,35 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
         }
 
         if (params.print_colors) {
+            // First collect all tokens for this segment
+            std::vector<whisper_token> segment_tokens;
+            for (int j = 0; j < whisper_full_n_tokens(ctx, i); ++j) {
+                const whisper_token id = whisper_full_get_token_id(ctx, i, j);
+                segment_tokens.push_back(id);
+            }
+            
+            // Now print tokens, replacing bias terms with original text
             for (int j = 0; j < whisper_full_n_tokens(ctx, i); ++j) {
                 if (params.print_special == false) {
                     const whisper_token id = whisper_full_get_token_id(ctx, i, j);
                     if (id >= whisper_token_eot(ctx)) {
+                        continue;
+                    }
+                }
+                
+                // Check if this position starts a bias term
+                if (bias_constraint && !bias_constraint->bias_terms.empty()) {
+                    int bias_idx = bias_constraint->match_bias_term(segment_tokens, j);
+                    if (bias_idx >= 0) {
+                        // Print the original bias term text with color
+                        const auto& bias_term = bias_constraint->bias_terms[bias_idx];
+                        const float p = whisper_full_get_token_p(ctx, i, j);
+                        const int col = std::max(0, std::min((int) k_colors.size() - 1, (int) (std::pow(p, 3)*float(k_colors.size()))));
+                        
+                        printf("%s%s%s%s", speaker.c_str(), k_colors[col].c_str(), bias_term.original_text.c_str(), "\033[0m");
+                        
+                        // Skip the tokens that make up this bias term
+                        j += bias_term.token_ids.size() - 1;
                         continue;
                     }
                 }
@@ -390,10 +606,41 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
                 printf("%s%s%s%s", speaker.c_str(), k_colors[col].c_str(), text, "\033[0m");
             }
         } else if (params.print_confidence) {
+            // First collect all tokens for this segment
+            std::vector<whisper_token> segment_tokens;
+            for (int j = 0; j < whisper_full_n_tokens(ctx, i); ++j) {
+                const whisper_token id = whisper_full_get_token_id(ctx, i, j);
+                segment_tokens.push_back(id);
+            }
+            
+            // Now print tokens, replacing bias terms with original text
             for (int j = 0; j < whisper_full_n_tokens(ctx, i); ++j) {
                 if (params.print_special == false) {
                     const whisper_token id = whisper_full_get_token_id(ctx, i, j);
                     if (id >= whisper_token_eot(ctx)) {
+                        continue;
+                    }
+                }
+                
+                // Check if this position starts a bias term
+                if (bias_constraint && !bias_constraint->bias_terms.empty()) {
+                    int bias_idx = bias_constraint->match_bias_term(segment_tokens, j);
+                    if (bias_idx >= 0) {
+                        // Print the original bias term text with confidence style
+                        const auto& bias_term = bias_constraint->bias_terms[bias_idx];
+                        const float p = whisper_full_get_token_p(ctx, i, j);
+                        
+                        int style_idx = 2;     // High confidence - dim
+                        if (p < 0.33) {
+                            style_idx = 0;     // Low confidence - inverse (highlighted)
+                        } else if (p < 0.66) {
+                            style_idx = 1;     // Medium confidence - underlined
+                        }
+                        
+                        printf("%s%s%s%s", speaker.c_str(), k_styles[style_idx].c_str(), bias_term.original_text.c_str(), "\033[0m");
+                        
+                        // Skip the tokens that make up this bias term
+                        j += bias_term.token_ids.size() - 1;
                         continue;
                     }
                 }
@@ -410,9 +657,9 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
                 printf("%s%s%s%s", speaker.c_str(), k_styles[style_idx].c_str(), text, "\033[0m");
             }
         } else {
-            const char * text = whisper_full_get_segment_text(ctx, i);
+            const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
 
-            printf("%s%s", speaker.c_str(), text);
+            printf("%s%s", speaker.c_str(), text.c_str());
         }
 
         if (params.tinydiarize) {
@@ -430,10 +677,10 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
     }
 }
 
-static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s, const bias_terms_constraint * bias_constraint) {
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i);
+        const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
         std::string speaker = "";
 
         if (params.diarize && pcmf32s.size() == 2)
@@ -447,12 +694,12 @@ static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const
     }
 }
 
-static void output_vtt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+static void output_vtt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s, const bias_terms_constraint * bias_constraint) {
     fout << "WEBVTT\n\n";
 
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i);
+        const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
         const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
         const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
         std::string speaker = "";
@@ -469,10 +716,10 @@ static void output_vtt(struct whisper_context * ctx, std::ofstream & fout, const
     }
 }
 
-static void output_srt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+static void output_srt(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s, const bias_terms_constraint * bias_constraint) {
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i);
+        const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
         const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
         const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
         std::string speaker = "";
@@ -551,7 +798,7 @@ static char * escape_double_quotes_in_csv(const char * str) {
     return escaped;
 }
 
-static void output_csv(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+static void output_csv(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s, const bias_terms_constraint * bias_constraint) {
     const int n_segments = whisper_full_n_segments(ctx);
     fout << "start,end,";
     if (params.diarize && pcmf32s.size() == 2)
@@ -561,10 +808,10 @@ static void output_csv(struct whisper_context * ctx, std::ofstream & fout, const
     fout << "text\n";
 
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i);
+        const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
         const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
         const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-        char * text_escaped = escape_double_quotes_in_csv(text);
+        char * text_escaped = escape_double_quotes_in_csv(text.c_str());
 
         //need to multiply times returned from whisper_full_get_segment_t{0,1}() by 10 to get milliseconds.
         fout << 10 * t0 << "," << 10 * t1 << ",";
@@ -573,6 +820,7 @@ static void output_csv(struct whisper_context * ctx, std::ofstream & fout, const
             fout << estimate_diarization_speaker(pcmf32s, t0, t1, true) << ",";
         }
         fout << "\"" << text_escaped << "\"\n";
+        free(text_escaped);
     }
 }
 
@@ -595,7 +843,8 @@ static void output_json(
              struct whisper_context * ctx,
                       std::ofstream & fout,
                const whisper_params & params,
-    std::vector<std::vector<float>>   pcmf32s) {
+    std::vector<std::vector<float>>   pcmf32s,
+           const bias_terms_constraint * bias_constraint) {
     const bool full = params.output_jsn_full;
     int indent = 0;
 
@@ -709,14 +958,14 @@ static void output_json(
 
             const int n_segments = whisper_full_n_segments(ctx);
             for (int i = 0; i < n_segments; ++i) {
-                const char * text = whisper_full_get_segment_text(ctx, i);
+                const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
 
                 const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
                 const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
 
                 start_obj(nullptr);
                     times_o(t0, t1, false);
-                    value_s("text", text, !params.diarize && !params.tinydiarize && !full);
+                    value_s("text", text.c_str(), !params.diarize && !params.tinydiarize && !full);
 
                     if (full) {
                         start_arr("tokens");
@@ -875,12 +1124,12 @@ static bool output_wts(struct whisper_context * ctx, std::ofstream & fout, const
     return true;
 }
 
-static void output_lrc(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+static void output_lrc(struct whisper_context * ctx, std::ofstream & fout, const whisper_params & params, std::vector<std::vector<float>> pcmf32s, const bias_terms_constraint * bias_constraint) {
     fout << "[by:whisper.cpp]\n";
 
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i);
+        const std::string text = rebuild_segment_text(ctx, i, bias_constraint);
         const int64_t t = whisper_full_get_segment_t0(ctx, i);
 
         int64_t msec = t * 10;
@@ -1105,6 +1354,9 @@ int main(int argc, char ** argv) {
         std::vector<float> pcmf32;               // mono-channel F32 PCM
         std::vector<std::vector<float>> pcmf32s; // stereo-channel F32 PCM
 
+        // Initialize bias terms constraint for this file
+        bias_terms_constraint bias_constraint;
+
         if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
             fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
             continue;
@@ -1202,7 +1454,7 @@ int main(int argc, char ** argv) {
             wparams.vad_params.speech_pad_ms           = params.vad_speech_pad_ms;
             wparams.vad_params.samples_overlap         = params.vad_samples_overlap;
 
-            whisper_print_user_data user_data = { &params, &pcmf32s, 0 };
+            whisper_print_user_data user_data = { &params, &pcmf32s, 0, nullptr };
 
             const auto & grammar_parsed = params.grammar_parsed;
             auto grammar_rules = grammar_parsed.c_rules();
@@ -1254,6 +1506,16 @@ int main(int argc, char ** argv) {
                 wparams.abort_callback_user_data = &is_aborted;
             }
 
+            // Setup bias terms constraint if provided
+            if (!params.bias_terms.empty()) {
+                bias_constraint.init(ctx, params.bias_terms);
+                if (!bias_constraint.bias_token_sequences.empty()) {
+                    wparams.logits_filter_callback = bias_terms_logits_filter;
+                    wparams.logits_filter_callback_user_data = &bias_constraint;
+                    user_data.bias_constraint = &bias_constraint;
+                }
+            }
+
             if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                 return 10;
@@ -1268,13 +1530,13 @@ int main(int argc, char ** argv) {
 }
 #define output_ext(ext, ...) output_func(output_##ext, "." #ext, params.output_##ext, __VA_ARGS__)
 
-            output_ext(txt, pcmf32s);
-            output_ext(vtt, pcmf32s);
-            output_ext(srt, pcmf32s);
+            output_ext(txt, pcmf32s, &bias_constraint);
+            output_ext(vtt, pcmf32s, &bias_constraint);
+            output_ext(srt, pcmf32s, &bias_constraint);
             output_ext(wts, pcmf32s, fname_inp.c_str(), float(pcmf32.size() + 1000)/WHISPER_SAMPLE_RATE, fout_factory.fname_out.c_str());
-            output_ext(csv, pcmf32s);
-            output_func(output_json, ".json", params.output_jsn, pcmf32s);
-            output_ext(lrc, pcmf32s);
+            output_ext(csv, pcmf32s, &bias_constraint);
+            output_func(output_json, ".json", params.output_jsn, pcmf32s, &bias_constraint);
+            output_ext(lrc, pcmf32s, &bias_constraint);
             output_func(output_score, ".score.txt", params.log_score, pcmf32s);
 
 #undef output_ext
