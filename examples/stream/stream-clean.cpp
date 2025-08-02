@@ -338,8 +338,12 @@ int main(int argc, char ** argv) {
             
             for (int i = 0; i < n_segments; ++i) {
                 const char * text = whisper_full_get_segment_text(ctx, i);
-                // Skip blank audio segments
-                if (text && strcmp(text, "[BLANK_AUDIO]") != 0) {
+                // Skip blank audio and other non-speech tokens
+                if (text && 
+                    strcmp(text, "[BLANK_AUDIO]") != 0 &&
+                    strcmp(text, "[SOUND]") != 0 &&
+                    strncmp(text, ">>", 2) != 0 &&
+                    text[0] != '[') {  // Skip any token that starts with [
                     current_text += text;
                 }
             }
@@ -365,28 +369,12 @@ int main(int argc, char ** argv) {
                         prompt_tokens.clear();
                         pcmf32_old.clear();
                     } else {
-                        // Real-time update - show just the new part
-                        printf("\r");  // Carriage return to overwrite current line
-                        
-                        // Show accumulated text for this segment
-                        std::string display_text = accumulated_text + current_text;
-                        printf("%s", display_text.c_str());
-                        
-                        // Add padding to clear any previous longer text
-                        printf("%*s", std::max(0, 80 - (int)display_text.length()), "");
-                        
+                        // Real-time update - just append the new text
+                        printf("%s ", current_text.c_str());
                         fflush(stdout);
                         
-                        accumulated_text = display_text;
-                        
-                        // If we detect end of sentence, commit it to full session
-                        char last_char = current_text.back();
-                        if ((last_char == '.' || last_char == '!' || last_char == '?') && silence_duration_ms > 300) {
-                            full_session_text += accumulated_text + " ";
-                            accumulated_text.clear();
-                            printf("\n");  // New line for next sentence
-                            fflush(stdout);
-                        }
+                        // Keep track of everything for final transcription
+                        full_session_text += current_text + " ";
                     }
                 }
             }

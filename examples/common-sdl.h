@@ -1,7 +1,12 @@
 #pragma once
 
+#ifdef SDL3
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_audio.h>
+#else
 #include <SDL.h>
 #include <SDL_audio.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -33,6 +38,7 @@ public:
 
 private:
     SDL_AudioDeviceID m_dev_id_in = 0;
+    SDL_AudioStream*  m_stream = nullptr;
 
     int m_len_ms = 0;
     int m_sample_rate = 0;
@@ -41,6 +47,7 @@ private:
     std::mutex       m_mutex;
 
     std::vector<float> m_audio;
+    std::vector<float> m_audio_new;
     size_t             m_audio_pos = 0;
     size_t             m_audio_len = 0;
 };

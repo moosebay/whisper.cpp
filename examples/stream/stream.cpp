@@ -38,7 +38,7 @@ struct whisper_params {
     bool use_gpu       = true;
     bool flash_attn    = false;
 
-    std::string language  = "en";
+    std::string language  = "auto";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
 };
@@ -300,7 +300,15 @@ int main(int argc, char ** argv) {
             audio.get(2000, pcmf32_new);
 
             if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
+                // Speech detected!
+                auto t_speech_detected = std::chrono::high_resolution_clock::now();
+                fprintf(stderr, "\n[VAD] Speech detected! Capturing %dms of audio...\n", params.length_ms);
+                
                 audio.get(params.length_ms, pcmf32);
+                
+                auto t_capture_done = std::chrono::high_resolution_clock::now();
+                auto capture_duration = std::chrono::duration_cast<std::chrono::milliseconds>(t_capture_done - t_speech_detected).count();
+                fprintf(stderr, "[VAD] Audio capture completed in %ldms\n", capture_duration);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -312,6 +320,9 @@ int main(int argc, char ** argv) {
 
         // run the inference
         {
+            // Start timing the transcription
+            auto t_inference_start = std::chrono::high_resolution_clock::now();
+            
             whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
 
             wparams.print_progress   = false;
@@ -340,9 +351,35 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                 return 6;
             }
+            
+            // End timing and calculate duration
+            auto t_inference_end = std::chrono::high_resolution_clock::now();
+            auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(t_inference_end - t_inference_start).count();
+            
+            // Calculate audio duration in milliseconds
+            float audio_duration_ms = (float)pcmf32.size() * 1000.0f / WHISPER_SAMPLE_RATE;
+            float rtf = (float)inference_duration / audio_duration_ms;  // Real-time factor
+            
+            fprintf(stderr, "\n[TIMING] Transcription took %ldms for %.1fs of audio (RTF: %.2fx, %s real-time)\n", 
+                    inference_duration, 
+                    audio_duration_ms / 1000.0f,
+                    rtf,
+                    rtf < 1.0f ? "faster than" : "slower than");
+            
+            if (use_vad) {
+                fprintf(stderr, "[TIMING] Time from speech detection to transcription completion: %ldms\n", 
+                        inference_duration);
+            }
 
             // print result;
             {
+                // Print detected language if auto-detection is enabled
+                if (params.language == "auto") {
+                    const int lang_id = whisper_full_lang_id(ctx);
+                    const char* detected_lang = whisper_lang_str(lang_id);
+                    fprintf(stderr, "[LANGUAGE] Detected language: %s\n", detected_lang);
+                }
+                
                 if (!use_vad) {
                     printf("\33[2K\r");
 
