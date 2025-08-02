@@ -13,9 +13,8 @@
 #include <vector>
 #include <atomic>
 #include <signal.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <cstring>
+#include <unistd.h>
 
 // Global flag for signal-based termination
 std::atomic<bool> g_force_transcribe(false);
@@ -28,35 +27,6 @@ void handle_sigusr1(int sig) {
     }
 }
 
-// Check for stdin commands (non-blocking)
-bool check_stdin_command() {
-    // Make stdin non-blocking
-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-    
-    char buffer[256];
-    ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
-    
-    // Restore blocking mode
-    fcntl(STDIN_FILENO, F_SETFL, flags);
-    
-    if (bytes_read > 0) {
-        buffer[bytes_read] = '\0';
-        std::string cmd(buffer);
-        
-        // Remove newline
-        if (!cmd.empty() && cmd.back() == '\n') {
-            cmd.pop_back();
-        }
-        
-        // Check for 'f' command
-        if (cmd == "f" || cmd == "F") {
-            return true;
-        }
-    }
-    
-    return false;
-}
 
 struct whisper_params {
     int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
@@ -105,7 +75,6 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
             fprintf(stderr, "\n");
             fprintf(stderr, "Signal control:\n");
             fprintf(stderr, "  - Send SIGUSR1 to trigger immediate transcription\n");
-            fprintf(stderr, "  - Type 'finish' + Enter to trigger immediate transcription\n");
             fprintf(stderr, "\n");
             exit(0);
         }
@@ -186,7 +155,7 @@ int main(int argc, char ** argv) {
     std::vector<whisper_token> prompt_tokens;
     
     // Output initialization
-    fprintf(stderr, "\n[Ready] Type 'f' for full transcription. Signal SIGUSR1 for Electron integration.\n\n");
+    fprintf(stderr, "\n[Ready] Send SIGUSR1 signal for immediate transcription.\n\n");
     fflush(stderr);
     
     int n_iter = 0;
@@ -202,6 +171,9 @@ int main(int argc, char ** argv) {
     int silence_duration_ms = 0;
     int no_speech_iterations = 0;
     
+    // Track timing for forced transcription
+    auto t_force_start = std::chrono::high_resolution_clock::now();
+    
     // main audio loop
     while (is_running) {
         // Check for termination signals
@@ -211,11 +183,8 @@ int main(int argc, char ** argv) {
             break;
         }
         
-        // Check for stdin command
-        bool force_transcribe_stdin = check_stdin_command();
-        
         // Check if we should force transcription
-        bool should_force = g_force_transcribe.exchange(false) || force_transcribe_stdin;
+        bool should_force = g_force_transcribe.exchange(false);
         
         // Collect audio samples
         while (true) {
@@ -233,7 +202,7 @@ int main(int argc, char ** argv) {
             }
             
             // Check signals while waiting
-            if (g_force_transcribe || check_stdin_command()) {
+            if (g_force_transcribe) {
                 should_force = true;
                 g_force_transcribe = false;
                 break;
@@ -278,9 +247,10 @@ int main(int argc, char ** argv) {
         bool is_final_transcription = false;
         
         if (should_force) {
-            // 'f' command - get everything immediately
+            // SIGUSR1 received - get everything immediately
             should_transcribe = true;
             is_final_transcription = true;
+            t_force_start = std::chrono::high_resolution_clock::now(); // Record when signal was received
             fprintf(stderr, "\n");
         } else if (has_speech && silence_duration_ms > 500) {
             // Natural pause detected after speech - show incremental update
@@ -358,8 +328,26 @@ int main(int argc, char ** argv) {
                     if (is_final_transcription) {
                         // Final transcription - output everything clean
                         printf("\n[FINAL TRANSCRIPTION]\n");
-                        printf("%s%s\n", full_session_text.c_str(), current_text.c_str());
+                        
+                        // Clean the full session text to remove any remaining [BLANK_AUDIO]
+                        std::string cleaned_text = full_session_text;
+                        size_t pos = 0;
+                        while ((pos = cleaned_text.find("[BLANK_AUDIO]")) != std::string::npos) {
+                            cleaned_text.erase(pos, 13); // Length of "[BLANK_AUDIO]"
+                        }
+                        
+                        // Trim extra spaces
+                        while (cleaned_text.find("  ") != std::string::npos) {
+                            cleaned_text.replace(cleaned_text.find("  "), 2, " ");
+                        }
+                        
+                        printf("%s%s\n", cleaned_text.c_str(), current_text.c_str());
                         printf("[END TRANSCRIPTION]\n");
+                        
+                        // Calculate and show timing
+                        auto t_now = std::chrono::high_resolution_clock::now();
+                        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_force_start).count();
+                        printf("[LATENCY: %ldms]\n", latency_ms);
                         fflush(stdout);
                         
                         // Reset for next session
@@ -374,7 +362,10 @@ int main(int argc, char ** argv) {
                         fflush(stdout);
                         
                         // Keep track of everything for final transcription
-                        full_session_text += current_text + " ";
+                        // Don't add empty strings or duplicates
+                        if (!current_text.empty()) {
+                            full_session_text += current_text + " ";
+                        }
                     }
                 }
             }
