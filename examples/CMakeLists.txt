@@ -5,10 +5,55 @@ find_package(Threads REQUIRED)
 # third-party
 
 if (WHISPER_SDL2)
-    # SDL2
-    find_package(SDL2 REQUIRED)
-
-    string(STRIP "${SDL2_LIBRARIES}" SDL2_LIBRARIES)
+    # SDL2 - Direct static SDL3 setup
+    set(SDL2_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../deps/SDL2/include")
+    set(SDL2_LIBRARIES 
+        "${CMAKE_CURRENT_SOURCE_DIR}/../deps/SDL2/build/libSDL3.a"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../deps/SDL2/build/libSDL_uclibc.a"
+    )
+    
+    # Add macOS frameworks for static linking
+    if(APPLE)
+        find_library(COREAUDIO_LIB CoreAudio REQUIRED)
+        find_library(AUDIOUNIT_LIB AudioUnit REQUIRED)
+        find_library(AUDIOTOOLBOX_LIB AudioToolbox REQUIRED)
+        find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)
+        find_library(COCOA_LIB Cocoa REQUIRED)
+        find_library(CARBON_LIB Carbon REQUIRED)
+        find_library(IOKIT_LIB IOKit REQUIRED)
+        find_library(FORCEFEEDBACK_LIB ForceFeedback REQUIRED)
+        find_library(COREVIDEO_LIB CoreVideo REQUIRED)
+        find_library(COREGRAPHICS_LIB CoreGraphics REQUIRED)
+        find_library(METAL_LIB Metal REQUIRED)
+        find_library(QUARTZCORE_LIB QuartzCore REQUIRED)
+        find_library(AVFOUNDATION_LIB AVFoundation REQUIRED)
+        find_library(GAMECONTROLLER_LIB GameController REQUIRED)
+        find_library(UNIFORMTYPEIDENTIFIERS_LIB UniformTypeIdentifiers REQUIRED)
+        find_library(COREHAPTICS_LIB CoreHaptics REQUIRED)
+        find_library(COREMEDIA_LIB CoreMedia REQUIRED)
+        
+        list(APPEND SDL2_LIBRARIES
+            ${COREAUDIO_LIB}
+            ${AUDIOUNIT_LIB}
+            ${AUDIOTOOLBOX_LIB}
+            ${COREFOUNDATION_LIB}
+            ${COCOA_LIB}
+            ${CARBON_LIB}
+            ${IOKIT_LIB}
+            ${FORCEFEEDBACK_LIB}
+            ${COREVIDEO_LIB}
+            ${COREGRAPHICS_LIB}
+            ${METAL_LIB}
+            ${QUARTZCORE_LIB}
+            ${AVFOUNDATION_LIB}
+            ${GAMECONTROLLER_LIB}
+            ${UNIFORMTYPEIDENTIFIERS_LIB}
+            ${COREHAPTICS_LIB}
+            ${COREMEDIA_LIB}
+        )
+    endif()
+    
+    set(SDL2_FOUND TRUE)
 
     message(STATUS "SDL2_INCLUDE_DIRS = ${SDL2_INCLUDE_DIRS}")
     message(STATUS "SDL2_LIBRARIES    = ${SDL2_LIBRARIES}")
@@ -73,13 +118,18 @@ if (WHISPER_SDL2)
 
     add_library(${TARGET} STATIC
         common-sdl.h
-        common-sdl.cpp
+        common-sdl3.cpp
         )
 
     include(DefaultTargetOptions)
 
     target_include_directories(${TARGET} PUBLIC  ${SDL2_INCLUDE_DIRS})
     target_link_libraries     (${TARGET} PRIVATE ${SDL2_LIBRARIES})
+    
+    # Add SDL3 definition if we're using SDL3
+    if(EXISTS "${SDL2_INCLUDE_DIRS}/SDL3/SDL.h")
+        target_compile_definitions(${TARGET} PUBLIC SDL3)
+    endif()
 
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
     set_target_properties(${TARGET} PROPERTIES FOLDER "libs")
@@ -102,6 +152,7 @@ elseif(CMAKE_JS_VERSION)
     add_subdirectory(addon.node)
 else()
     add_subdirectory(cli)
+    add_subdirectory(cli-realtime)
     add_subdirectory(bench)
     add_subdirectory(server)
     add_subdirectory(quantize)
@@ -111,6 +162,7 @@ else()
         add_subdirectory(command)
         add_subdirectory(talk-llama)
         add_subdirectory(lsp)
+        add_subdirectory(realtime)
         if (GGML_SYCL)
             add_subdirectory(sycl)
         endif()
