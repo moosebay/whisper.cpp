@@ -256,6 +256,7 @@ int main(int argc, char ** argv) {
     // Track recording state
     bool was_recording = false;
     std::string accumulated_text;
+    bool is_final_transcription = false;
     
     auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
@@ -279,6 +280,7 @@ int main(int argc, char ** argv) {
             was_recording = true;
             accumulated_text.clear();
             prompt_tokens.clear(); // Clear context for new session
+            is_final_transcription = false;
         } else if (!g_is_recording && was_recording) {
             // Just stopped recording - output final transcription
             if (!accumulated_text.empty()) {
@@ -319,6 +321,18 @@ int main(int argc, char ** argv) {
                 if (!is_running) {
                     break;
                 }
+                
+                // Check if we should stop recording immediately
+                if (g_force_transcribe) {
+                    // Get any remaining audio
+                    audio->get(100, pcmf32_new); // Get last 100ms
+                    if (pcmf32_new.size() > 0) {
+                        audio->clear();
+                        is_final_transcription = true;
+                        break;
+                    }
+                }
+                
                 audio->get(params.step_ms, pcmf32_new);
 
                 if ((int) pcmf32_new.size() > 2*n_samples_step) {
@@ -327,7 +341,7 @@ int main(int argc, char ** argv) {
                     continue;
                 }
 
-                if ((int) pcmf32_new.size() >= n_samples_step) {
+                if ((int) pcmf32_new.size() >= n_samples_step || g_force_transcribe) {
                     audio->clear();
                     break;
                 }
@@ -338,7 +352,7 @@ int main(int argc, char ** argv) {
             const int n_samples_new = pcmf32_new.size();
 
             // take up to params.length_ms audio from previous iteration
-            const int n_samples_take = std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
+            const int n_samples_take = is_final_transcription ? (int)pcmf32_old.size() : std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
 
             //printf("processing: take = %d, new = %d, old = %d\n", n_samples_take, n_samples_new, (int) pcmf32_old.size());
 
@@ -386,6 +400,11 @@ int main(int argc, char ** argv) {
         {
             // Start timing the transcription
             auto t_inference_start = std::chrono::high_resolution_clock::now();
+            
+            // If this is final transcription, mark when we started processing
+            if (is_final_transcription) {
+                fprintf(stderr, "[Processing final transcription...]\n");
+            }
             
             whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
 
@@ -519,6 +538,12 @@ int main(int argc, char ** argv) {
             }
 
             ++n_iter;
+            
+            // Reset final transcription flag
+            if (is_final_transcription) {
+                is_final_transcription = false;
+                g_force_transcribe = false;
+            }
 
             if (!use_vad && (n_iter % n_new_line) == 0) {
                 if (!g_is_recording) {
