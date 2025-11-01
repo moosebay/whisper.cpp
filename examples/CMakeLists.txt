@@ -118,7 +118,7 @@ if (WHISPER_SDL2)
 
     add_library(${TARGET} STATIC
         common-sdl.h
-        common-sdl3.cpp
+        common-sdl.cpp
         )
 
     include(DefaultTargetOptions)

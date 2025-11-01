@@ -1,7 +1,16 @@
 // Real-time speech recognition of input from a microphone
 //
-// A very quick-n-dirty implementation serving mainly as a proof of concept.
+// Variant: RECORD → BUFFER → SINGLE FINAL TRANSCRIPTION
+// -----------------------------------------------------
+// - While recording (SIGUSR2): we ONLY collect audio into one big buffer.
+//   We do NOT append text from partial / sliding windows, so no duplicates.
+// - When recording stops (SIGUSR1): we run ONE whisper_full(...) over the
+//   ENTIRE buffered audio and print once.
 //
+// This gives the best accuracy (like transcribing a WAV) and avoids the
+// duplicated segments that come from overlapping windows.
+//
+
 #include "common-sdl.h"
 #include "common.h"
 #include "common-whisper.h"
@@ -39,11 +48,11 @@ void handle_sigusr2(int sig) {
 // command-line parameters
 struct whisper_params {
     int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    int32_t step_ms    = 3000;
+    int32_t step_ms    = 3000;   // kept for CLI compatibility, not used in final pass
     int32_t length_ms  = 10000;
     int32_t keep_ms    = 200;
     int32_t capture_id = -1;
-    int32_t max_tokens = 32;
+    int32_t max_tokens = 0;
     int32_t audio_ctx  = 0;
     int32_t beam_size  = -1;
 
@@ -54,9 +63,9 @@ struct whisper_params {
     bool no_fallback   = false;
     bool print_special = false;
     bool no_context    = true;
-    bool no_timestamps = false;
+    bool no_timestamps = true;   // we do a final pass, can be changed with CLI
     bool tinydiarize   = false;
-    bool save_audio    = false; // save audio to wav file
+    bool save_audio    = false;
     bool use_gpu       = true;
     bool flash_attn    = false;
 
@@ -96,7 +105,6 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-sa"   || arg == "--save-audio")    { params.save_audio    = true; }
         else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
         else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
-
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             whisper_print_usage(argc, argv, params);
@@ -114,7 +122,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,       --help          [default] show this help message and exit\n");
     fprintf(stderr, "  -t N,     --threads N     [%-7d] number of threads to use during computation\n",    params.n_threads);
-    fprintf(stderr, "            --step N        [%-7d] audio step size in milliseconds\n",                params.step_ms);
+    fprintf(stderr, "            --step N        [%-7d] audio step size in milliseconds (not used in final mode)\n", params.step_ms);
     fprintf(stderr, "            --length N      [%-7d] audio length in milliseconds\n",                   params.length_ms);
     fprintf(stderr, "            --keep N        [%-7d] audio to keep from previous step in ms\n",         params.keep_ms);
     fprintf(stderr, "  -c ID,    --capture ID    [%-7d] capture device ID\n",                              params.capture_id);
@@ -126,7 +134,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -tr,      --translate     [%-7s] translate from source language to english\n",      params.translate ? "true" : "false");
     fprintf(stderr, "  -nf,      --no-fallback   [%-7s] do not use temperature fallback while decoding\n", params.no_fallback ? "true" : "false");
     fprintf(stderr, "  -ps,      --print-special [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
-    fprintf(stderr, "  -kc,      --keep-context  [%-7s] keep context between audio chunks\n",              params.no_context ? "false" : "true");
+    fprintf(stderr, "  -kc,      --keep-context  [%-7s] keep context between audio chunks (used only if you re-enable streaming)\n", params.no_context ? "false" : "true");
     fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                                params.language.c_str());
     fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
     fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
@@ -145,31 +153,14 @@ int main(int argc, char ** argv) {
     signal(SIGUSR2, handle_sigusr2);
 
     whisper_params params;
-
     if (whisper_params_parse(argc, argv, params) == false) {
         return 1;
     }
 
-    params.keep_ms   = std::min(params.keep_ms,   params.step_ms);
-    params.length_ms = std::max(params.length_ms, params.step_ms);
-
-    const int n_samples_step = (1e-3*params.step_ms  )*WHISPER_SAMPLE_RATE;
-    const int n_samples_len  = (1e-3*params.length_ms)*WHISPER_SAMPLE_RATE;
-    const int n_samples_keep = (1e-3*params.keep_ms  )*WHISPER_SAMPLE_RATE;
-    const int n_samples_30s  = (1e-3*30000.0         )*WHISPER_SAMPLE_RATE;
-
-    const bool use_vad = n_samples_step <= 0; // sliding window mode uses VAD
-
-    const int n_new_line = !use_vad ? std::max(1, params.length_ms / params.step_ms - 1) : 1; // number of steps to print new line
-
-    params.no_timestamps  = !use_vad;
-    params.no_context    |= use_vad;
-    params.max_tokens     = 0;
-
     // init audio
     audio_async * audio = nullptr;
 
-    // whisper init
+    // init whisper
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
         whisper_print_usage(argc, argv, params);
@@ -177,7 +168,6 @@ int main(int argc, char ** argv) {
     }
 
     struct whisper_context_params cparams = whisper_context_default_params();
-
     cparams.use_gpu    = params.use_gpu;
     cparams.flash_attn = params.flash_attn;
 
@@ -187,85 +177,43 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    std::vector<float> pcmf32    (n_samples_30s, 0.0f);
-    std::vector<float> pcmf32_old;
-    std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
-
-    std::vector<whisper_token> prompt_tokens;
-
-    // print some info about the processing
-    {
-        fprintf(stderr, "\n");
-        if (!whisper_is_multilingual(ctx)) {
-            if (params.language != "en" || params.translate) {
-                params.language = "en";
-                params.translate = false;
-                fprintf(stderr, "%s: WARNING: model is not multilingual, ignoring language and translation options\n", __func__);
-            }
-        }
-        fprintf(stderr, "%s: processing %d samples (step = %.1f sec / len = %.1f sec / keep = %.1f sec), %d threads, lang = %s, task = %s, timestamps = %d ...\n",
-                __func__,
-                n_samples_step,
-                float(n_samples_step)/WHISPER_SAMPLE_RATE,
-                float(n_samples_len )/WHISPER_SAMPLE_RATE,
-                float(n_samples_keep)/WHISPER_SAMPLE_RATE,
-                params.n_threads,
-                params.language.c_str(),
-                params.translate ? "translate" : "transcribe",
-                params.no_timestamps ? 0 : 1);
-
-        if (!use_vad) {
-            fprintf(stderr, "%s: n_new_line = %d, no_context = %d\n", __func__, n_new_line, params.no_context);
-        } else {
-            fprintf(stderr, "%s: using VAD, will transcribe on speech activity\n", __func__);
-        }
-
-        fprintf(stderr, "\n");
-    }
-
-    int n_iter = 0;
-
-    bool is_running = true;
+    // big buffer that will hold ALL audio for the current recording session
+    std::vector<float> recorded_audio;
 
     std::ofstream fout;
-    if (params.fname_out.length() > 0) {
+    if (!params.fname_out.empty()) {
         fout.open(params.fname_out);
         if (!fout.is_open()) {
-            fprintf(stderr, "%s: failed to open output file '%s'!\n", __func__, params.fname_out.c_str());
+            fprintf(stderr, "error: failed to open output file '%s'\n", params.fname_out.c_str());
             return 1;
         }
     }
 
     wav_writer wavWriter;
-    // save wav file
     if (params.save_audio) {
-        // Get current date/time for filename
         time_t now = time(0);
         char buffer[80];
         strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localtime(&now));
         std::string filename = std::string(buffer) + ".wav";
-
         wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
     }
+
     printf("[Start speaking]\n");
     fflush(stdout);
+    fprintf(stderr, "[Model loaded] Send SIGUSR2 to start recording, SIGUSR1 to stop and transcribe.\n");
 
-    // Output initialization
-    fprintf(stderr, "\n[Model loaded] Send SIGUSR2 to start recording, SIGUSR1 to stop and transcribe.\n");
-    
-    // Track recording state
-    bool was_recording = false;
-    std::string accumulated_text;
-    bool is_final_transcription = false;
-    
-    auto t_last  = std::chrono::high_resolution_clock::now();
-    const auto t_start = t_last;
+    bool is_running     = true;
+    bool was_recording  = false;
 
-    // main audio loop
     while (is_running) {
-        // Handle recording state changes
+        // handle SDL / Ctrl+C
+        is_running = sdl_poll_events();
+        if (!is_running) {
+            break;
+        }
+
+        // just started recording
         if (g_is_recording && !was_recording) {
-            // Just started recording - create audio device
             if (audio == nullptr) {
                 audio = new audio_async(params.length_ms);
                 if (!audio->init(params.capture_id, WHISPER_SAMPLE_RATE)) {
@@ -277,300 +225,98 @@ int main(int argc, char ** argv) {
                 }
                 audio->resume();
             }
+            recorded_audio.clear();
             was_recording = true;
-            accumulated_text.clear();
-            prompt_tokens.clear(); // Clear context for new session
-            is_final_transcription = false;
-        } else if (!g_is_recording && was_recording) {
-            // Just stopped recording - output final transcription
-            if (!accumulated_text.empty()) {
-                printf("%s\n", accumulated_text.c_str());
-                fflush(stdout);
+        }
+
+        // just stopped recording
+        if (!g_is_recording && was_recording) {
+            fprintf(stderr, "[Recording stopped - transcribing...]\n");
+
+            // final transcription over the FULL buffer
+            if (!recorded_audio.empty()) {
+                whisper_full_params wparams =
+                    whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH
+                                                                     : WHISPER_SAMPLING_GREEDY);
+
+                wparams.print_progress   = false;
+                wparams.print_special    = params.print_special;
+                wparams.print_realtime   = false;
+                wparams.print_timestamps = !params.no_timestamps;
+                wparams.translate        = params.translate;
+                wparams.single_segment   = false;
+                wparams.max_tokens       = params.max_tokens;
+                wparams.language         = params.language.c_str();
+                wparams.n_threads        = params.n_threads;
+                wparams.beam_search.beam_size = params.beam_size;
+                wparams.audio_ctx        = params.audio_ctx;
+                wparams.tdrz_enable      = params.tinydiarize;
+                wparams.temperature_inc  = params.no_fallback ? 0.0f : wparams.temperature_inc;
+
+                auto t0 = std::chrono::high_resolution_clock::now();
+                if (whisper_full(ctx, wparams, recorded_audio.data(), recorded_audio.size()) != 0) {
+                    fprintf(stderr, "error: final transcription failed\n");
+                } else {
+                    std::string final_text;
+                    const int n_segments = whisper_full_n_segments(ctx);
+                    for (int i = 0; i < n_segments; ++i) {
+                        const char * text = whisper_full_get_segment_text(ctx, i);
+                        if (params.no_timestamps) {
+                            final_text += text;
+                        } else {
+                            const int64_t t0_ms = whisper_full_get_segment_t0(ctx, i);
+                            const int64_t t1_ms = whisper_full_get_segment_t1(ctx, i);
+                            final_text += "[" + to_timestamp(t0_ms, false) + " --> " + to_timestamp(t1_ms, false) + "] ";
+                            final_text += text;
+                            final_text += "\n";
+                        }
+                    }
+
+                    // print once
+                    printf("%s\n", final_text.c_str());
+                    fflush(stdout);
+
+                    if (fout.is_open()) {
+                        fout << final_text << std::endl;
+                    }
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+                fprintf(stderr, "[Final transcription took %ld ms]\n", (long)dur);
             }
-            // Destroy audio device
+
+            // teardown audio
             if (audio != nullptr) {
                 audio->pause();
                 delete audio;
                 audio = nullptr;
             }
-            was_recording = false;
-            fprintf(stderr, "[Recording stopped - microphone disconnected]\n");
-        }
-        
-        // If not recording, just wait
-        if (!g_is_recording || audio == nullptr) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            was_recording     = false;
+            g_force_transcribe = false;
             continue;
         }
-        if (params.save_audio) {
-            wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
-        }
-        // handle Ctrl + C
-        is_running = sdl_poll_events();
 
-        if (!is_running) {
-            break;
+        // if not recording, rest
+        if (!g_is_recording || audio == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
         }
 
-        // process new audio
-
-        if (!use_vad) {
-            while (true) {
-                // handle Ctrl + C
-                is_running = sdl_poll_events();
-                if (!is_running) {
-                    break;
-                }
-                
-                // Check if we should stop recording immediately
-                if (g_force_transcribe) {
-                    // Get any remaining audio
-                    audio->get(100, pcmf32_new); // Get last 100ms
-                    if (pcmf32_new.size() > 0) {
-                        audio->clear();
-                        is_final_transcription = true;
-                        break;
-                    }
-                }
-                
-                audio->get(params.step_ms, pcmf32_new);
-
-                if ((int) pcmf32_new.size() > 2*n_samples_step) {
-                    fprintf(stderr, "\n\n%s: WARNING: cannot process audio fast enough, dropping audio ...\n\n", __func__);
-                    audio->clear();
-                    continue;
-                }
-
-                if ((int) pcmf32_new.size() >= n_samples_step || g_force_transcribe) {
-                    audio->clear();
-                    break;
-                }
-
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // we ARE recording: keep reading small chunks and append to big buffer
+        std::vector<float> chunk;
+        audio->get(200, chunk); // 200 ms
+        if (!chunk.empty()) {
+            recorded_audio.insert(recorded_audio.end(), chunk.begin(), chunk.end());
+            if (params.save_audio) {
+                wavWriter.write(chunk.data(), chunk.size());
             }
-
-            const int n_samples_new = pcmf32_new.size();
-
-            // take up to params.length_ms audio from previous iteration
-            const int n_samples_take = is_final_transcription ? (int)pcmf32_old.size() : std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
-
-            //printf("processing: take = %d, new = %d, old = %d\n", n_samples_take, n_samples_new, (int) pcmf32_old.size());
-
-            pcmf32.resize(n_samples_new + n_samples_take);
-
-            for (int i = 0; i < n_samples_take; i++) {
-                pcmf32[i] = pcmf32_old[pcmf32_old.size() - n_samples_take + i];
-            }
-
-            memcpy(pcmf32.data() + n_samples_take, pcmf32_new.data(), n_samples_new*sizeof(float));
-
-            pcmf32_old = pcmf32;
-        } else {
-            const auto t_now  = std::chrono::high_resolution_clock::now();
-            const auto t_diff = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_last).count();
-
-            if (t_diff < 2000) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-                continue;
-            }
-
-            audio->get(2000, pcmf32_new);
-
-            if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
-                // Speech detected!
-                auto t_speech_detected = std::chrono::high_resolution_clock::now();
-                fprintf(stderr, "\n[VAD] Speech detected! Capturing %dms of audio...\n", params.length_ms);
-                
-                audio->get(params.length_ms, pcmf32);
-                
-                auto t_capture_done = std::chrono::high_resolution_clock::now();
-                auto capture_duration = std::chrono::duration_cast<std::chrono::milliseconds>(t_capture_done - t_speech_detected).count();
-                fprintf(stderr, "[VAD] Audio capture completed in %ldms\n", capture_duration);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-                continue;
-            }
-
-            t_last = t_now;
         }
 
-        // run the inference
-        {
-            // Start timing the transcription
-            auto t_inference_start = std::chrono::high_resolution_clock::now();
-            
-            // If this is final transcription, mark when we started processing
-            if (is_final_transcription) {
-                fprintf(stderr, "[Processing final transcription...]\n");
-            }
-            
-            whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
-
-            wparams.print_progress   = false;
-            wparams.print_special    = params.print_special;
-            wparams.print_realtime   = false;
-            wparams.print_timestamps = !params.no_timestamps;
-            wparams.translate        = params.translate;
-            wparams.single_segment   = !use_vad;
-            wparams.max_tokens       = params.max_tokens;
-            wparams.language         = params.language.c_str();
-            wparams.n_threads        = params.n_threads;
-            wparams.beam_search.beam_size = params.beam_size;
-
-            wparams.audio_ctx        = params.audio_ctx;
-
-            wparams.tdrz_enable      = params.tinydiarize; // [TDRZ]
-
-            // disable temperature fallback
-            //wparams.temperature_inc  = -1.0f;
-            wparams.temperature_inc  = params.no_fallback ? 0.0f : wparams.temperature_inc;
-
-            wparams.prompt_tokens    = params.no_context ? nullptr : prompt_tokens.data();
-            wparams.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
-
-            if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
-                fprintf(stderr, "%s: failed to process audio\n", argv[0]);
-                return 6;
-            }
-            
-            // End timing and calculate duration
-            auto t_inference_end = std::chrono::high_resolution_clock::now();
-            auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(t_inference_end - t_inference_start).count();
-            
-            // Calculate audio duration in milliseconds
-            float audio_duration_ms = (float)pcmf32.size() * 1000.0f / WHISPER_SAMPLE_RATE;
-            float rtf = (float)inference_duration / audio_duration_ms;  // Real-time factor
-            
-            fprintf(stderr, "\n[TIMING] Transcription took %ldms for %.1fs of audio (RTF: %.2fx, %s real-time)\n", 
-                    inference_duration, 
-                    audio_duration_ms / 1000.0f,
-                    rtf,
-                    rtf < 1.0f ? "faster than" : "slower than");
-            
-            if (use_vad) {
-                fprintf(stderr, "[TIMING] Time from speech detection to transcription completion: %ldms\n", 
-                        inference_duration);
-            }
-
-            // print result;
-            {
-                // Print detected language if auto-detection is enabled
-                if (params.language == "auto") {
-                    const int lang_id = whisper_full_lang_id(ctx);
-                    const char* detected_lang = whisper_lang_str(lang_id);
-                    fprintf(stderr, "[LANGUAGE] Detected language: %s\n", detected_lang);
-                }
-                
-                if (!g_is_recording) {
-                    // Only show output when not recording
-                    if (!use_vad) {
-                        printf("\33[2K\r");
-
-                        // print long empty line to clear the previous line
-                        printf("%s", std::string(100, ' ').c_str());
-
-                        printf("\33[2K\r");
-                    } else {
-                        const int64_t t1 = (t_last - t_start).count()/1000000;
-                        const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
-
-                        printf("\n");
-                        printf("### Transcription %d START | t0 = %d ms | t1 = %d ms\n", n_iter, (int) t0, (int) t1);
-                        printf("\n");
-                    }
-                }
-
-                const int n_segments = whisper_full_n_segments(ctx);
-                for (int i = 0; i < n_segments; ++i) {
-                    const char * text = whisper_full_get_segment_text(ctx, i);
-
-                    if (params.no_timestamps) {
-                        // Don't print during recording - only accumulate
-                        if (!g_is_recording) {
-                            printf("%s", text);
-                            fflush(stdout);
-                        }
-                        
-                        // Always accumulate text for final output
-                        accumulated_text += text;
-
-                        if (params.fname_out.length() > 0) {
-                            fout << text;
-                        }
-                    } else {
-                        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-                        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-
-                        std::string output = "[" + to_timestamp(t0, false) + " --> " + to_timestamp(t1, false) + "]  " + text;
-
-                        if (whisper_full_get_segment_speaker_turn_next(ctx, i)) {
-                            output += " [SPEAKER_TURN]";
-                        }
-
-                        output += "\n";
-
-                        // Don't print during recording
-                        if (!g_is_recording) {
-                            printf("%s", output.c_str());
-                            fflush(stdout);
-                        }
-                        
-                        // Always accumulate just the text part for final output
-                        accumulated_text += text;
-                        accumulated_text += " ";
-
-                        if (params.fname_out.length() > 0) {
-                            fout << output;
-                        }
-                    }
-                }
-
-                if (params.fname_out.length() > 0) {
-                    fout << std::endl;
-                }
-
-                if (use_vad && !g_is_recording) {
-                    printf("\n");
-                    printf("### Transcription %d END\n", n_iter);
-                }
-            }
-
-            ++n_iter;
-            
-            // Reset final transcription flag
-            if (is_final_transcription) {
-                is_final_transcription = false;
-                g_force_transcribe = false;
-            }
-
-            if (!use_vad && (n_iter % n_new_line) == 0) {
-                if (!g_is_recording) {
-                    printf("\n");
-                }
-
-                // keep part of the audio for next iteration to try to mitigate word boundary issues
-                pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
-
-                // Add tokens of the last full length segment as the prompt
-                if (!params.no_context) {
-                    prompt_tokens.clear();
-
-                    const int n_segments = whisper_full_n_segments(ctx);
-                    for (int i = 0; i < n_segments; ++i) {
-                        const int token_count = whisper_full_n_tokens(ctx, i);
-                        for (int j = 0; j < token_count; ++j) {
-                            prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
-                        }
-                    }
-                }
-            }
-            fflush(stdout);
-        }
+        // small sleep to avoid busy loop
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // Clean up audio device if it exists
     if (audio != nullptr) {
         audio->pause();
         delete audio;
